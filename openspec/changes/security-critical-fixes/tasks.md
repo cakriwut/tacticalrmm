@@ -6,15 +6,16 @@
 - [ ] 1.4 Remove hardcoded Facebook token from `gs-web-app/app/src/common/config.js` — replace with runtime env var or server-side proxy call
 - [ ] 1.5 Verify no other hardcoded secrets remain in the gs-web-app bundle (scan: `grep -r "password\|token\|secret\|k2Zs" app/src/`)
 
-## 2. gd-es-middleware — Write-Path Authentication
+## 2. gd-es-middleware — Write-Path Authentication (Option A: Field Blocklist Middleware)
 
-- [ ] 2.1 Instantiate `AuthManager` in `documents.controller.ts::updateDocument()` — call `authManager.validate()` before processing; return 401 if validation fails
-- [ ] 2.2 Instantiate `AuthManager` in `documents.controller.ts::saveDocument()` — call `authManager.validate()` before processing; return 401 if validation fails
-- [ ] 2.3 Implement field blocklist function — strip `depRole`, `_depIds`, `_superAdmin`, `_id` from `req.body` before passing to `elastic.updateDocument()` (bypass for SUPER_ADMIN callers)
-- [ ] 2.4 Implement ownership check for `_dataSource: "user"` writes — assert `req.body._id === authManager.userDoc._id`; return 403 on mismatch
-- [ ] 2.5 Write unit tests for 2.1–2.4: 401 on missing header, 401 on unknown user, 403 on ownership mismatch, field stripping for each blocked field, SUPER_ADMIN bypass
-- [ ] 2.6 Integration test: confirm the original exploit path (`PATCH /documents` with `depRole: SUPER_ADMIN` as DEPARTMENT_HEAD) returns 401/403
-- [ ] 2.7 Run `lsp_diagnostics` / TypeScript build on changed files — zero errors before merge
+- [ ] 2.1 Implement `parseIdentity` middleware (`src/middleware/parseIdentity.ts`) — decode `X-Cyber-Userinfo` header (base64 JSON) into `res.locals.user`; return HTTP 401 if header absent or malformed
+- [ ] 2.2 Implement `validateUser` middleware (`src/middleware/validateUser.ts`) — instantiate `AuthManager` with resolved username; call `validate()`; return HTTP 401 if user doc not found in ES `user` index
+- [ ] 2.3 Implement `fieldGuard` middleware (`src/middleware/fieldGuard.ts`) — role-keyed allowlist in **reject mode**: blocked fields `depRole`, `_depIds`, `_superAdmin`, `_id` for non-SUPER_ADMIN callers; return HTTP 403 `{ error: "FIELD_WRITE_FORBIDDEN", fields: [...] }` (do NOT strip silently)
+- [ ] 2.4 Implement `ownershipCheck` middleware (`src/middleware/ownershipCheck.ts`) — for `_dataSource: "user"` writes, assert `req.body._id === res.locals.user.userDoc._id`; return HTTP 403 on mismatch
+- [ ] 2.5 Register middleware chain on all write routes in `documents.router.ts`: `router.patch('/documents', parseIdentity, validateUser, fieldGuard, ownershipCheck, updateDocument)` and `router.post('/documents', parseIdentity, validateUser, fieldGuard, saveDocument)`
+- [ ] 2.6 Write unit tests for all 4 middleware: 401 on missing/malformed `X-Cyber-Userinfo`, 401 on unknown user, 403 `FIELD_WRITE_FORBIDDEN` for each blocked field (`depRole`, `_depIds`, `_superAdmin`, `_id`), SUPER_ADMIN bypass (all fields pass), 403 on ownership mismatch for `_dataSource: "user"`
+- [ ] 2.7 Integration test: confirm the original exploit path (`PATCH /documents` with `depRole: SUPER_ADMIN` as DEPARTMENT_HEAD) returns HTTP 403 with `fields: ["depRole"]`
+- [ ] 2.8 Run `lsp_diagnostics` / TypeScript build on changed files — zero errors before merge
 
 ## 3. gs-mgt-server — bcrypt Password Storage
 
@@ -26,19 +27,21 @@
 - [ ] 3.6 Write unit tests for migration script: idempotency (already-bcrypt record untouched), plaintext record is migrated correctly
 - [ ] 3.7 Schedule and run migration script in dev → staging → prod (maintenance window); verify all user logins work after each environment
 
-## 4. DocServerV2 — Write-Path Authentication + OPA Dead Code Removal
+## 4. DocServerV2 — Write-Path Authentication + OPA Dead Code Removal (Option A: FastAPI Depends + Pydantic)
 
-- [ ] 4.1 Audit all internal callers of DocServerV2 write routes — confirm they pass `X-Cyber-Userinfo` header (or document which ones don't and need to be updated)
-- [ ] 4.2 Implement `require_identity()` FastAPI dependency in DocServerV2 — decode `X-Cyber-Userinfo` header (base64 JSON); return HTTP 401 if absent or malformed
-- [ ] 4.3 Inject `require_identity` dependency into `create_document` route handler
-- [ ] 4.4 Inject `require_identity` dependency into `update_document` (PATCH) route handler
-- [ ] 4.5 Inject `require_identity` dependency into `delete_document` route handler
-- [ ] 4.6 Inject `require_identity` dependency into `_bulkInsert`, `_bulkDelete`, `_bulkUpdate` route handlers
-- [ ] 4.7 Delete dead OPA code: `api/rego/opa.py`, `api/policies/policy.rego`, `api/policies/accesscontrol.rego`
-- [ ] 4.8 Remove `AUTHORIZED_MODE` env var references from `config.py` and all route handlers
-- [ ] 4.9 Write unit tests for `require_identity()`: 401 on missing header, 401 on malformed base64, 401 on non-JSON payload, successful decode of valid header
-- [ ] 4.10 Integration test: confirm `PATCH /docs/{collection}/{id}` without `X-Cyber-Userinfo` returns 401
-- [ ] 4.11 Run pytest on changed files — zero failures before merge
+- [ ] 4.1 Audit all internal callers of DocServerV2 write routes — confirm they pass `X-Cyber-Userinfo` header (or document which ones don't and need updating before deploy)
+- [ ] 4.2 Implement `require_identity()` FastAPI dependency (`api/deps/auth.py`) — decode `X-Cyber-Userinfo` header (base64 JSON); return HTTP 401 if absent or malformed; reuse decode pattern from Trino connector routes
+- [ ] 4.3 Implement `field_guard()` FastAPI dependency (`api/deps/auth.py`) — role-keyed blocklist in **reject mode**: blocked fields `depRole`, `_depIds`, `_superAdmin`, `_id` for non-SUPER_ADMIN callers; return HTTP 403 `{ "error": "FIELD_WRITE_FORBIDDEN", "fields": [...] }`
+- [ ] 4.4 Implement Pydantic models `UserPatchAdmin` and `UserPatchRestricted` (`api/models/user_patch.py`) — `UserPatchRestricted` declares only non-privileged fields with `model_config = {"extra": "forbid"}`
+- [ ] 4.5 Inject `require_identity` + `field_guard` dependencies into `create_document` route handler
+- [ ] 4.6 Inject `require_identity` + `field_guard` dependencies into `update_document` (PATCH) route handler; apply `UserPatchAdmin` / `UserPatchRestricted` model based on caller role
+- [ ] 4.7 Inject `require_identity` + `field_guard` dependencies into `delete_document` route handler
+- [ ] 4.8 Inject `require_identity` + `field_guard` dependencies into `_bulkInsert`, `_bulkDelete`, `_bulkUpdate` route handlers
+- [ ] 4.9 Delete dead OPA code: `api/rego/opa.py`, `api/policies/policy.rego`, `api/policies/accesscontrol.rego`
+- [ ] 4.10 Remove `AUTHORIZED_MODE` env var references from `config.py` and all route handlers
+- [ ] 4.11 Write unit tests for `require_identity()` and `field_guard()`: 401 on missing/malformed header, 403 `FIELD_WRITE_FORBIDDEN` for each blocked field, SUPER_ADMIN bypass, Pydantic 422 for privileged fields on `UserPatchRestricted`, 401 on each bulk mutation route without header
+- [ ] 4.12 Integration test: confirm `PATCH /docs/{collection}/{id}` without `X-Cyber-Userinfo` returns 401; with DEPARTMENT_HEAD + `depRole` field returns 403
+- [ ] 4.13 Run pytest on changed files — zero failures before merge
 
 ## 5. authserver — Endpoint Hardening
 
@@ -59,7 +62,7 @@
 
 ## 7. Quality Gates
 
-- [ ] 7.1 All unit tests pass (zero failures) for each service modified (2.5, 3.5, 3.6, 4.9, 5.4, 6.6)
+- [ ] 7.1 All unit tests pass (zero failures) for each service modified (2.6, 3.5, 3.6, 4.11, 5.4, 6.6)
 - [ ] 7.2 Integration test confirms original P0 exploit path returns 401/403 on dev and staging
 - [ ] 7.3 `lsp_diagnostics` / build clean on all modified TypeScript files (gd-es-middleware)
 - [ ] 7.4 pytest clean on all modified Python files (DocServerV2, authserver)
