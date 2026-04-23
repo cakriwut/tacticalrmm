@@ -24,21 +24,41 @@ Stack: Azure Kubernetes (`cyber` namespace), Traefik ingress with `traefik-forwa
 
 ## Decisions
 
-### D1 — Write-path auth in gd-es-middleware: reuse existing AuthManager, not a new JWT validator
+### D1 — Write-path auth in gd-es-middleware: `parseIdentity` middleware + `fieldGuard` middleware (Option A)
 
-**Decision**: Instantiate `AuthManager` at the start of `updateDocument()` and `saveDocument()` controllers and call `validate()` before proceeding.
+**Decision**: Add two Express middleware functions to all write routes: (1) `parseIdentity` decodes `X-Cyber-Userinfo` (base64 JSON) into `res.locals.user`; (2) `fieldGuard` enforces a role-keyed field allowlist in **reject mode** (returns 403, does not silently strip). Also instantiate `AuthManager` to validate the resolved username against the ES `user` index and confirm the user exists.
 
-**Rationale**: AuthManager already exists in the codebase (`src/core_modules/gs-auth/`), reads `x-auth-userid` / `x-forwarded-user` (injected by Traefik), looks up the user ES doc, and returns the validated identity. Reusing it is the minimal, consistent change. No new dependencies needed.
+Route registration:
+```typescript
+router.patch('/documents', parseIdentity, validateUser, fieldGuard, ownershipCheck, updateDocument);
+router.post('/documents',  parseIdentity, validateUser, fieldGuard, saveDocument);
+```
 
-**Alternative considered**: Verify bearer token against Keycloak introspection endpoint. Rejected — authserver calls Keycloak Admin API (remote call overhead), and the existing `x-forwarded-user` header is already verified by `traefik-forward-auth` before reaching the service. Adding a second remote call adds latency and a new failure mode.
+Field allowlist:
+```typescript
+const WRITE_POLICY = {
+  SUPER_ADMIN:     new Set(['depRole', '_depIds', '_superAdmin', 'email', 'displayName', 'isActive', ...]),
+  DEPARTMENT_HEAD: new Set(['email', 'displayName']),
+  MEMBER:          new Set(['displayName']),
+};
+// Any field NOT in the caller's allowed set → HTTP 403 { error: 'FIELD_WRITE_FORBIDDEN', fields: [...] }
+```
 
-### D2 — Field blocklist in gd-es-middleware: strip at controller layer
+**Rationale**: Reject mode (not strip mode) is chosen because silent stripping hides the error from the client and makes debugging harder. Explicit 403 forces callers to be correct and is auditable. `parseIdentity` reads from the Traefik-injected header — never from `req.body` — so the identity source cannot be forged via the request payload.
 
-**Decision**: Before passing `req.body` to `elastic.updateDocument()`, strip the fields `depRole`, `_depIds`, `_superAdmin`, `_id` from the update payload unless the caller's `depRole` is `SUPER_ADMIN`.
+**Alternative considered**: Reuse existing `AuthManager.validate()` as the sole guard. Rejected as insufficient — `AuthManager` validates identity but has no field-level write policy. Both layers are required: identity verification AND field allowlist.
 
-**Rationale**: Ownership check (D3) prevents cross-user writes; the field blocklist prevents a legitimate user from escalating their own role. Defense-in-depth.
+**Alternative considered**: Verify bearer token against Keycloak introspection endpoint. Rejected — adds 20–150ms RTT + Keycloak load. `traefik-forward-auth` already verified the token at ingress; `X-Cyber-Userinfo` reflects the verified identity.
 
-**Alternative considered**: Schema validation with JSON Schema. More thorough but heavier to retrofit; blocklist is sufficient for the specific exploit vectors identified.
+### D2 — Field blocklist in gd-es-middleware: reject mode, not strip mode
+
+**Decision**: `fieldGuard` middleware computes the set of submitted fields that the caller's role is not permitted to write. If the set is non-empty, return HTTP 403 with `{ error: "FIELD_WRITE_FORBIDDEN", fields: ["depRole", ...] }`. Do NOT silently strip fields.
+
+Blocked fields for non-SUPER_ADMIN: `depRole`, `_depIds`, `_superAdmin`, `_id`.
+
+**Rationale**: Reject mode makes the security boundary visible to callers and auditable in logs. Silent stripping hides misconfigured clients; reject forces them to send only what they're allowed to. Defense-in-depth: ownership check (D3) prevents cross-user writes; the field blocklist prevents a legitimate user from escalating their own role in the same call.
+
+**Alternative considered**: Strip blocked fields and proceed silently. Rejected — harder to audit, hides bugs in calling clients, and provides no signal to detect exploit attempts.
 
 ### D3 — Ownership check in gd-es-middleware: `_id` in body must match authenticated user's ES doc ID
 
@@ -54,13 +74,34 @@ Stack: Azure Kubernetes (`cyber` namespace), Traefik ingress with `traefik-forwa
 
 **Risk**: If migration script fails mid-run, some accounts have bcrypt and some have plaintext. Mitigation: run migration in a transaction-like loop with per-document error handling; keep a backup.
 
-### D5 — DocServerV2 write auth: identity from `X-Cyber-Userinfo` header, 401 if absent
+### D5 — DocServerV2 write auth: `require_identity()` + `field_guard()` FastAPI dependencies + Pydantic discriminated models
 
-**Decision**: Add a FastAPI dependency function `require_identity()` that decodes the `X-Cyber-Userinfo` header (base64 JSON, already injected by Traefik). Inject it into `create_document`, `update_document`, `delete_document`, `bulk_insert`, `bulk_delete`, `bulk_update` route handlers. Return HTTP 401 if header is absent or malformed. Delete the orphan OPA files (`api/rego/opa.py`, `api/policies/`) as part of this PR.
+**Decision**: Three-layer authorization for DocServerV2 writes:
 
-**Rationale**: `X-Cyber-Userinfo` is already parsed in Trino connector routes — reuse the same pattern. Deleting dead OPA code reduces confusion and future audit surface.
+1. **`require_identity()` dependency** — decodes `X-Cyber-Userinfo` header (base64 JSON, Traefik-injected). Returns 401 if absent or malformed. Reuses the same decode pattern already used in Trino connector routes.
 
-**Alternative considered**: Keep OPA, deploy a standalone OPA sidecar. Rejected — OPA was never deployed in production, and deploying a new sidecar to every DocServerV2 replica is disproportionate to the goal of gating writes.
+2. **`field_guard()` dependency** — enforces role-keyed field blocklist (same policy as gd-es-middleware). For user-document writes, blocks `depRole`, `_depIds`, `_superAdmin`, `_id` for non-SUPER_ADMIN callers. Returns 403 with `{"error": "FIELD_WRITE_FORBIDDEN", "fields": [...]}`.
+
+3. **Pydantic discriminated models** (defense-in-depth) — `UserPatchAdmin` (all fields) vs `UserPatchRestricted` (`extra="forbid"`, no privileged fields declared). The correct model is selected based on caller role. Even if a middleware bug allows a request through, Pydantic raises HTTP 422 if a blocked field is present in `UserPatchRestricted`.
+
+Route pattern:
+```python
+@router.patch("/docs/{collection}/{id}")
+async def update_document(
+    collection: str, id: str,
+    caller: dict = Depends(require_identity),
+    body: dict = Depends(field_guard),
+):
+    ...
+```
+
+Delete orphan OPA files (`api/rego/opa.py`, `api/policies/policy.rego`, `api/policies/accesscontrol.rego`) and all `AUTHORIZED_MODE` references in the same PR.
+
+**Rationale**: Three layers ensure no single point of failure. `require_identity` gates the request. `field_guard` applies role policy. Pydantic model catches schema-level bypasses. `X-Cyber-Userinfo` decode reuses the existing pattern in the codebase — no new library needed.
+
+**Alternative considered**: Keep OPA, deploy a standalone OPA sidecar. Rejected — OPA was never deployed in production; deploying a new sidecar adds operational overhead disproportionate to the goal. Inline Python policy is correct for a single service.
+
+**Alternative considered**: Keycloak introspection per write request. Rejected — adds network latency; ingress already verified the token. Trusted header is sufficient when Traefik is the only ingress and network policy enforces it.
 
 ### D6 — authserver `/license/import/csv`: add `validate_token` dependency
 
