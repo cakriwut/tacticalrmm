@@ -130,6 +130,19 @@ EOF
 
   echo "${localvars}" >${TACTICAL_DIR}/api/tacticalrmm/local_settings.py
 
+  # Override agent signing server to use self-hosted agent distribution
+  if [ -n "${AGENT_BASE_URL}" ]; then
+    cat <<AGENTEOF >>${TACTICAL_DIR}/api/tacticalrmm/local_settings.py
+
+# Self-hosted agent distribution server
+AGENT_BASE_URL = '${AGENT_BASE_URL}'
+CHECK_TOKEN_URL = '${AGENT_BASE_URL}/api/v2/checktoken'
+AGENTS_URL = '${AGENT_BASE_URL}/api/v2/agents/?'
+EXE_GEN_URL = '${AGENT_BASE_URL}/api/v2/exe'
+WEBTAR_DL_URL = '${AGENT_BASE_URL}/api/v2/webtar/?'
+AGENTEOF
+  fi
+
   # run migrations and init scripts
   python manage.py pre_update_tasks
   python manage.py migrate --no-input
