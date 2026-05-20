@@ -61,7 +61,8 @@ async def fetch_binary(version: str, plat: str, arch: str) -> Path:
 
     cached.parent.mkdir(parents=True, exist_ok=True)
 
-    url = f"https://github.com/{GITHUB_REPO}/releases/download/{version}/{filename}"
+    tag = version if version.startswith("v") else f"v{version}"
+    url = f"https://github.com/{GITHUB_REPO}/releases/download/{tag}/{filename}"
     log.info("Downloading: %s", url)
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
