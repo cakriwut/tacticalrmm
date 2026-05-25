@@ -43,7 +43,7 @@ BINARY_CACHE_DIR = Path(os.environ.get("BINARY_CACHE_DIR", "/data/agents"))
 BINARY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MESH_HOST = os.environ.get("MESH_HOST", "")
 
-SFX_MODULE = "/usr/lib/p7zip/7z.sfx"
+SFX_MODULE = os.environ.get("SFX_MODULE", "/app/7z.sfx")
 
 PLATFORM_MAP = {
     ("linux", "amd64"): "tacticalagent-linux-amd64",
