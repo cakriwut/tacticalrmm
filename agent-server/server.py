@@ -188,23 +188,38 @@ async def get_latest_release_tag() -> str:
         return r.json()["tag_name"]
 
 
+def _to_int(val, default=0) -> int:
+    if isinstance(val, bool):
+        return int(val)
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        if val.lower() in ("true", "1", "yes"):
+            return 1
+        if val.lower() in ("false", "0", "no", ""):
+            return 0
+        try:
+            return int(val)
+        except ValueError:
+            return default
+    return default
+
+
 def build_ps1(data: Dict[str, Any]) -> str:
-    rdp_val = int(data.get("rdp", 0))
-    ping_val = int(data.get("ping", 0))
-    power_val = int(data.get("power", 0))
+    rdp_val = _to_int(data.get("rdp", 0))
+    ping_val = _to_int(data.get("ping", 0))
+    power_val = _to_int(data.get("power", 0))
 
     ps1 = PS1_TEMPLATE
     ps1 = ps1.replace("__APIHOST__", str(data.get("api", "")))
     ps1 = ps1.replace("__CLIENT__", str(data.get("client", "")))
     ps1 = ps1.replace("__SITE__", str(data.get("site", "")))
     ps1 = ps1.replace("__AGENTTYPE__", str(data.get("agenttype", "workstation")))
-    ps1 = ps1.replace("__POWER__", str(rdp_val))
+    ps1 = ps1.replace("__POWER__", str(power_val))
     ps1 = ps1.replace("__RDP__", str(rdp_val))
     ps1 = ps1.replace("__PING__", str(ping_val))
     ps1 = ps1.replace("__TOKEN__", str(data.get("token", "")))
     ps1 = ps1.replace("__DLURL__", str(data.get("url", "")))
-    # mesh download URL: derive from api host and mesh group id (passed as url context)
-    # For simplicity the caller passes all needed info; mesh URL comes from agent-server itself
     mesh_host = MESH_HOST or str(data.get("api", "")).replace("api.", "mesh.")
     raw_meshid = "sIeMDawdszrt6Gdofxx2qVLikdjaGgFY@UWeb8VrV@XaJQnoZm9K" + chr(36) + "cZHRPAYfJ" + chr(36) + "w"
     encoded_meshid = _urlparse.quote(raw_meshid, safe="")
