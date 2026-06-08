@@ -14,8 +14,11 @@ Changes:
      c. Add trmm-agent-server service
      d. Add agent-server nginx conf mount to trmm-nginx
      e. Add agent_server_data volume
+     f. Add SSO callback nginx conf and HTML bind mounts to trmm-nginx
   3. Write agents.s2t.ai nginx conf into /opt/tactical/agents.conf
-  4. Pull new images and restart containers
+  4. Write 00-sso-callback.conf into /opt/tactical/ (fixes Microsoft Entra SSO redirect → 404/expired)
+  5. Write sso-callback.html into /opt/tactical/ and Docker volume
+  6. Pull new images and restart containers
 """
 import base64
 import os
@@ -79,6 +82,163 @@ server {
     server_name agents.s2t.ai;
     return 301 https://$server_name$request_uri;
 }
+"""
+
+SSO_CALLBACK_CONF = """\
+# 00-sso-callback.conf — loaded before default.conf (alphabetical order) so this
+# server block wins for rmm.s2t.ai and the location = exact-match takes priority.
+# Fixes: Microsoft Entra SSO redirect → 404/expired because the Vue SPA has no
+# /account/provider/callback route and the frontend missing token exchange step.
+server {
+    resolver 127.0.0.11 valid=30s;
+    server_name rmm.s2t.ai;
+
+    listen 4443 ssl;
+    ssl_certificate /opt/tactical/certs/fullchain.pem;
+    ssl_certificate_key /opt/tactical/certs/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+    ssl_ecdh_curve secp384r1;
+    add_header X-Content-Type-Options nosniff;
+
+    # Exact match — intercept SSO callback BEFORE the Vue SPA proxy
+    # This page exchanges the allauth Django session for a Knox token and stores it
+    # in localStorage, then redirects to /
+    location = /account/provider/callback {
+        alias /opt/tactical/sso-callback.html;
+        add_header Content-Type "text/html; charset=utf-8";
+        add_header Cache-Control "no-store, no-cache, must-revalidate";
+    }
+
+    # All other requests proxied to Vue SPA
+    location / {
+        set $app http://tactical-frontend:8080;
+        proxy_pass $app;
+        proxy_http_version  1.1;
+        proxy_cache_bypass  $http_upgrade;
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-Port  $server_port;
+    }
+}
+"""
+
+SSO_CALLBACK_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Completing SSO Login...</title>
+  <script src="/env-config.js"></script>
+  <style>
+    body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1d1d1d; color: #fff; }
+    .box { text-align: center; }
+    .spinner { border: 3px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; width: 40px; height: 40px; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error { color: #f66; }
+    a { color: #7ec8e3; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div id="spinner" class="spinner"></div>
+    <p id="msg">Completing login...</p>
+  </div>
+  <script>
+    (async function () {
+      var spinner = document.getElementById('spinner');
+      var msg = document.getElementById('msg');
+
+      function getCookie(name) {
+        var v = null;
+        if (document.cookie) {
+          document.cookie.split(';').forEach(function (c) {
+            var t = c.trim();
+            if (t.substring(0, name.length + 1) === (name + '=')) {
+              v = decodeURIComponent(t.substring(name.length + 1));
+            }
+          });
+        }
+        return v;
+      }
+
+      function showError(text) {
+        spinner.style.display = 'none';
+        msg.className = 'error';
+        msg.innerHTML = text + '<br><br><a href="/login">Go back to Login</a>';
+      }
+
+      var params = new URLSearchParams(window.location.search);
+      var error = params.get('error');
+      if (error) {
+        showError('SSO login failed: ' + error);
+        return;
+      }
+
+      try {
+        // PROD_URL is set by /env-config.js (loaded in <head>)
+        var apiBase = (window._env_ && window._env_.PROD_URL) ? window._env_.PROD_URL : '';
+
+        // Exchange the allauth Django session (set by backend OIDC callback) for a Knox token
+        var resp = await fetch(apiBase + '/accounts/ssoproviders/token/', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': getCookie('csrftoken') || ''
+          },
+          body: JSON.stringify({})
+        });
+
+        if (!resp.ok) {
+          var errText = await resp.text();
+          throw new Error('Token exchange failed (' + resp.status + '): ' + errText);
+        }
+
+        var data = await resp.json();
+
+        // Store Knox token in localStorage using the same format as the Vue auth store.
+        // useStorage("access_token", null) uses the "any" serializer (default null type):
+        //   read:  e => e  (raw string, no JSON.parse)
+        //   write: e => String(e)
+        // Must store the raw string — NOT JSON.stringify() which wraps in quotes
+        // and causes Authorization: Token "abc..." to be rejected by the backend.
+        localStorage.setItem('access_token', data.token);
+        if (data.username) localStorage.setItem('user_name', data.username);
+        if (data.name) localStorage.setItem('name', data.name);
+        if (data.provider) localStorage.setItem('sso_provider', data.provider);
+
+        msg.textContent = 'Login successful! Redirecting...';
+
+        // Honour a saved next route (e.g. deep link set before SSO was triggered)
+        var next = '/';
+        try {
+          var savedNext = localStorage.getItem('next');
+          if (savedNext) {
+            var parsed = JSON.parse(savedNext);
+            if (parsed && parsed !== 'null') {
+              next = parsed;
+              localStorage.removeItem('next');
+            }
+          }
+        } catch (e) {}
+
+        window.location.replace(next);
+
+      } catch (err) {
+        showError('Login error: ' + err.message);
+        console.error('SSO callback error:', err);
+      }
+    })();
+  </script>
+</body>
+</html>
 """
 
 
@@ -209,6 +369,17 @@ def main():
         patched = patched.rstrip() + "\n\n" + AGENT_SERVER_SERVICE
         console.print("[green]trmm-agent-server service added[/green]")
 
+    # 3g. Add SSO callback nginx conf and HTML bind mounts to trmm-nginx
+    sso_conf_mount = "      - /opt/tactical/00-sso-callback.conf:/etc/nginx/conf.d/00-sso-callback.conf:ro"
+    sso_html_mount = "      - /opt/tactical/sso-callback.html:/opt/tactical/sso-callback.html:ro"
+    if "00-sso-callback.conf" not in patched:
+        # Insert after the agents.conf mount line
+        patched = patched.replace(
+            "      - /opt/tactical/agents.conf:/etc/nginx/conf.d/agents.conf:ro",
+            f"      - /opt/tactical/agents.conf:/etc/nginx/conf.d/agents.conf:ro\n{sso_conf_mount}\n{sso_html_mount}"
+        )
+        console.print("[green]SSO callback conf+html bind mounts added to trmm-nginx[/green]")
+
     if patched != compose:
         run(client, f"sudo cp {TACTICAL_DIR}/docker-compose.yml {TACTICAL_DIR}/docker-compose.yml.bak")
         write_remote_file(client, f"{TACTICAL_DIR}/docker-compose.yml", patched, sudo=True)
@@ -220,18 +391,38 @@ def main():
     run(client, f"cd {TACTICAL_DIR} && docker compose config --quiet")
     console.print("[green]docker-compose.yml is valid[/green]")
 
-    console.rule("[bold]Step 5: Pull images from ghcr.io[/bold]")
+    console.rule("[bold]Step 5: Write SSO callback nginx conf[/bold]")
+    existing_sso_conf = run(client, f"cat {TACTICAL_DIR}/00-sso-callback.conf 2>/dev/null || echo __MISSING__", check=False)
+    if "location = /account/provider/callback" in existing_sso_conf:
+        console.print("[yellow]00-sso-callback.conf already exists[/yellow]")
+    else:
+        write_remote_file(client, f"{TACTICAL_DIR}/00-sso-callback.conf", SSO_CALLBACK_CONF)
+        console.print("[green]00-sso-callback.conf written to /opt/tactical/00-sso-callback.conf[/green]")
+
+    console.rule("[bold]Step 6: Write SSO callback HTML page[/bold]")
+    existing_sso_html = run(client, f"cat {TACTICAL_DIR}/sso-callback.html 2>/dev/null || echo __MISSING__", check=False)
+    if "ssoproviders/token" in existing_sso_html:
+        console.print("[yellow]sso-callback.html already exists[/yellow]")
+    else:
+        write_remote_file(client, f"{TACTICAL_DIR}/sso-callback.html", SSO_CALLBACK_HTML)
+        console.print("[green]sso-callback.html written to /opt/tactical/sso-callback.html[/green]")
+    # Also write to the Docker volume so it's accessible inside containers
+    vol_path = "/var/lib/docker/volumes/tactical_tactical_data/_data/sso-callback.html"
+    run(client, f"cp {TACTICAL_DIR}/sso-callback.html {vol_path} && chmod 644 {vol_path}", check=False)
+    console.print("[green]sso-callback.html copied to tactical_data Docker volume[/green]")
+
+    console.rule("[bold]Step 7: Pull images from ghcr.io[/bold]")
     run(client, f"cd {TACTICAL_DIR} && docker pull ghcr.io/cakriwut/tactical:latest", check=True)
     run(client, f"cd {TACTICAL_DIR} && docker pull ghcr.io/cakriwut/agent-server:latest", check=True)
 
-    console.rule("[bold]Step 6: Restart containers[/bold]")
+    console.rule("[bold]Step 8: Restart containers[/bold]")
     run(client, f"cd {TACTICAL_DIR} && docker compose up -d")
     console.print("[green]docker compose up -d done[/green]")
 
     console.print("\nWaiting 15s for containers to settle...")
     time.sleep(15)
 
-    console.rule("[bold]Step 7: Verify[/bold]")
+    console.rule("[bold]Step 9: Verify[/bold]")
     run(client, "docker ps --format 'table {{.Names}}\t{{.Status}}'")
 
     console.rule("[bold cyan]Done[/bold cyan]")

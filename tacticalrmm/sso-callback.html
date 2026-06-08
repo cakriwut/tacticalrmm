@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Completing SSO Login...</title>
+  <script src="/env-config.js"></script>
+  <style>
+    body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #1d1d1d; color: #fff; }
+    .box { text-align: center; }
+    .spinner { border: 3px solid rgba(255,255,255,0.2); border-top-color: #fff; border-radius: 50%; width: 40px; height: 40px; animation: spin 0.8s linear infinite; margin: 0 auto 16px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error { color: #f66; }
+    a { color: #7ec8e3; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <div id="spinner" class="spinner"></div>
+    <p id="msg">Completing login...</p>
+  </div>
+  <script>
+    (async function () {
+      var spinner = document.getElementById('spinner');
+      var msg = document.getElementById('msg');
+
+      function getCookie(name) {
+        var v = null;
+        if (document.cookie) {
+          document.cookie.split(';').forEach(function (c) {
+            var t = c.trim();
+            if (t.substring(0, name.length + 1) === (name + '=')) {
+              v = decodeURIComponent(t.substring(name.length + 1));
+            }
+          });
+        }
+        return v;
+      }
+
+      function showError(text) {
+        spinner.style.display = 'none';
+        msg.className = 'error';
+        msg.innerHTML = text + '<br><br><a href="/login">Go back to Login</a>';
+      }
+
+      var params = new URLSearchParams(window.location.search);
+      var error = params.get('error');
+      if (error) {
+        showError('SSO login failed: ' + error);
+        return;
+      }
+
+      try {
+        // PROD_URL is set by /env-config.js (loaded in <head>)
+        var apiBase = (window._env_ && window._env_.PROD_URL) ? window._env_.PROD_URL : '';
+
+        // Exchange the allauth Django session (set by backend OIDC callback) for a Knox token
+        var resp = await fetch(apiBase + '/accounts/ssoproviders/token/', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': getCookie('csrftoken') || ''
+          },
+          body: JSON.stringify({})
+        });
+
+        if (!resp.ok) {
+          var errText = await resp.text();
+          throw new Error('Token exchange failed (' + resp.status + '): ' + errText);
+        }
+
+        var data = await resp.json();
+
+        // Store Knox token in localStorage using the same format as the Vue auth store.
+        // useStorage("access_token", null) uses the "any" serializer (default null type):
+        //   read:  e => e  (raw string, no JSON.parse)
+        //   write: e => String(e)
+        // So we must store the raw string — NOT JSON.stringify() which would wrap in quotes
+        // and cause Authorization: Token "abc..." to be rejected by the backend.
+        localStorage.setItem('access_token', data.token);
+        if (data.username) localStorage.setItem('user_name', data.username);
+        if (data.name) localStorage.setItem('name', data.name);
+        if (data.provider) localStorage.setItem('sso_provider', data.provider);
+
+        msg.textContent = 'Login successful! Redirecting...';
+
+        // Honour a saved next route (e.g. deep link set before SSO was triggered)
+        var next = '/';
+        try {
+          var savedNext = localStorage.getItem('next');
+          if (savedNext) {
+            var parsed = JSON.parse(savedNext);
+            if (parsed && parsed !== 'null') {
+              next = parsed;
+              localStorage.removeItem('next');
+            }
+          }
+        } catch (e) {}
+
+        window.location.replace(next);
+
+      } catch (err) {
+        showError('Login error: ' + err.message);
+        console.error('SSO callback error:', err);
+      }
+    })();
+  </script>
+</body>
+</html>
