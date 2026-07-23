@@ -4,21 +4,33 @@
 # dependencies = ["paramiko>=3.4", "rich>=13"]
 # ///
 """
-Apply self-hosted agent server changes to the TacticalRMM server.
+Apply self-hosted customizations and upgrades to the TacticalRMM server.
 
-Changes:
+Changes applied:
   1. Add AGENT_BASE_URL to .env
-  2. Patch docker-compose.yml:
+  2. Write AGENT_BASE_URL into local_settings.py on the tactical_data volume
+     (settings.py reads AGENT_BASE_URL as a Python constant, not os.environ —
+      the .env alone is insufficient; local_settings.py is the authoritative override)
+  3. Patch docker-compose.yml:
      a. Change tactical services to ghcr.io/cakriwut/tactical:latest
      b. Add AGENT_BASE_URL to tactical-init and tactical-backend environments
      c. Add trmm-agent-server service
      d. Add agent-server nginx conf mount to trmm-nginx
      e. Add agent_server_data volume
      f. Add SSO callback nginx conf and HTML bind mounts to trmm-nginx
-  3. Write agents.s2t.ai nginx conf into /opt/tactical/agents.conf
-  4. Write 00-sso-callback.conf into /opt/tactical/ (fixes Microsoft Entra SSO redirect → 404/expired)
-  5. Write sso-callback.html into /opt/tactical/ and Docker volume
-  6. Pull new images and restart containers
+  4. Write agents.s2t.ai nginx conf into /opt/tactical/agents.conf
+  5. Write 00-sso-callback.conf into /opt/tactical/
+  6. Write sso-callback.html into /opt/tactical/ (and into the tactical_data volume)
+  7. Pull new images and restart containers
+  8. Restart backend workers to reload local_settings.py
+
+NOTE on AGENT_BASE_URL:
+  The TacticalRMM adapter (ee/sso/adapter.py) calls token_is_valid() on every SSO
+  login. token_is_valid() POSTs to CHECK_TOKEN_URL = AGENT_BASE_URL + /api/v2/checktoken.
+  Without the override, it hits agents.tacticalrmm.com (upstream) which rejects the
+  selfhosted-bypass-token → PermissionDenied on SSO + license warning on dashboard.
+  local_settings.py is written by the container entrypoint but does NOT include
+  AGENT_BASE_URL — it must be appended manually and persists in the tactical_data volume.
 """
 import base64
 import os
@@ -309,7 +321,24 @@ def main():
         else:
             console.print(f"[yellow]AGENT_BASE_URL already set to {AGENT_BASE_URL}[/yellow]")
 
-    console.rule("[bold]Step 2: Write agents.s2t.ai nginx conf[/bold]")
+    console.rule("[bold]Step 2: Patch local_settings.py with AGENT_BASE_URL[/bold]")
+    # CRITICAL: settings.py hardcodes AGENT_BASE_URL = "https://agents.tacticalrmm.com"
+    # local_settings.py is the override file — the .env value is NOT read by Django.
+    # Without this, token_is_valid() and token_is_expired() call the upstream server
+    # which rejects the selfhosted-bypass-token → SSO PermissionDenied + dashboard
+    # license warning even when the token is present and the local agent server is up.
+    vol_local_settings = "/var/lib/docker/volumes/tactical_tactical_data/_data/api/tacticalrmm/local_settings.py"
+    ls_content = run(client, f"cat {vol_local_settings} 2>/dev/null || echo __MISSING__", check=False)
+    if f"AGENT_BASE_URL = '{AGENT_BASE_URL}'" in ls_content:
+        console.print(f"[yellow]local_settings.py already has AGENT_BASE_URL={AGENT_BASE_URL}[/yellow]")
+    elif "AGENT_BASE_URL" in ls_content:
+        run(client, f"sed -i \"s|^AGENT_BASE_URL = .*|AGENT_BASE_URL = '{AGENT_BASE_URL}'|\" {vol_local_settings}")
+        console.print(f"[green]AGENT_BASE_URL updated in local_settings.py[/green]")
+    else:
+        run(client, f"echo \"AGENT_BASE_URL = '{AGENT_BASE_URL}'\" >> {vol_local_settings}")
+        console.print(f"[green]AGENT_BASE_URL appended to local_settings.py[/green]")
+
+    console.rule("[bold]Step 3: Write agents.s2t.ai nginx conf[/bold]")
     existing = run(client, f"cat {TACTICAL_DIR}/agents.conf 2>/dev/null || echo __MISSING__", check=False)
     if "agents.s2t.ai" in existing:
         console.print("[yellow]agents.conf already exists[/yellow]")
@@ -318,7 +347,7 @@ def main():
         write_remote_file(client, f"{TACTICAL_DIR}/agents.conf", AGENTS_NGINX_CONF)
         console.print("[green]agents.conf written to /opt/tactical/agents.conf[/green]")
 
-    console.rule("[bold]Step 3: Patch docker-compose.yml[/bold]")
+    console.rule("[bold]Step 4: Patch docker-compose.yml[/bold]")
     compose = run(client, f"cat {TACTICAL_DIR}/docker-compose.yml")
     patched = compose
 
@@ -387,11 +416,11 @@ def main():
     else:
         console.print("[yellow]docker-compose.yml already fully patched[/yellow]")
 
-    console.rule("[bold]Step 4: Validate compose[/bold]")
+    console.rule("[bold]Step 5: Validate compose[/bold]")
     run(client, f"cd {TACTICAL_DIR} && docker compose config --quiet")
     console.print("[green]docker-compose.yml is valid[/green]")
 
-    console.rule("[bold]Step 5: Write SSO callback nginx conf[/bold]")
+    console.rule("[bold]Step 6: Write SSO callback nginx conf[/bold]")
     existing_sso_conf = run(client, f"cat {TACTICAL_DIR}/00-sso-callback.conf 2>/dev/null || echo __MISSING__", check=False)
     if "location = /account/provider/callback" in existing_sso_conf:
         console.print("[yellow]00-sso-callback.conf already exists[/yellow]")
@@ -399,7 +428,7 @@ def main():
         write_remote_file(client, f"{TACTICAL_DIR}/00-sso-callback.conf", SSO_CALLBACK_CONF)
         console.print("[green]00-sso-callback.conf written to /opt/tactical/00-sso-callback.conf[/green]")
 
-    console.rule("[bold]Step 6: Write SSO callback HTML page[/bold]")
+    console.rule("[bold]Step 7: Write SSO callback HTML page[/bold]")
     existing_sso_html = run(client, f"cat {TACTICAL_DIR}/sso-callback.html 2>/dev/null || echo __MISSING__", check=False)
     if "ssoproviders/token" in existing_sso_html:
         console.print("[yellow]sso-callback.html already exists[/yellow]")
@@ -411,26 +440,38 @@ def main():
     run(client, f"cp {TACTICAL_DIR}/sso-callback.html {vol_path} && chmod 644 {vol_path}", check=False)
     console.print("[green]sso-callback.html copied to tactical_data Docker volume[/green]")
 
-    console.rule("[bold]Step 7: Pull images from ghcr.io[/bold]")
+    console.rule("[bold]Step 8: Pull latest images[/bold]")
     run(client, f"cd {TACTICAL_DIR} && docker pull ghcr.io/cakriwut/tactical:latest", check=True)
     run(client, f"cd {TACTICAL_DIR} && docker pull ghcr.io/cakriwut/agent-server:latest", check=True)
 
-    console.rule("[bold]Step 8: Restart containers[/bold]")
+    console.rule("[bold]Step 9: Restart containers[/bold]")
     run(client, f"cd {TACTICAL_DIR} && docker compose up -d")
     console.print("[green]docker compose up -d done[/green]")
 
-    console.print("\nWaiting 15s for containers to settle...")
-    time.sleep(15)
+    console.print("\nWaiting 20s for containers to start...")
+    time.sleep(20)
 
-    console.rule("[bold]Step 9: Verify[/bold]")
+    # Explicit backend restart ensures workers reload local_settings.py with the
+    # correct AGENT_BASE_URL. compose up -d only recreates containers whose config
+    # changed; if the compose file was already up to date the backend won't restart
+    # and will keep the stale in-memory settings.AGENT_BASE_URL from its initial load.
+    console.rule("[bold]Step 10: Restart backend workers (reload local_settings.py)[/bold]")
+    run(client, f"cd {TACTICAL_DIR} && docker compose restart tactical-backend tactical-celery tactical-celerybeat tactical-websockets")
+    console.print("[green]Backend workers restarted — local_settings.py reloaded[/green]")
+
+    console.print("\nWaiting 10s for workers to come up...")
+    time.sleep(10)
+
+    console.rule("[bold]Step 11: Verify[/bold]")
     run(client, "docker ps --format 'table {{.Names}}\t{{.Status}}'")
 
     console.rule("[bold cyan]Done[/bold cyan]")
     console.print("\n[bold green]All changes applied.[/bold green]")
     console.print("\nVerification:")
     console.print("  • Login: https://rmm.s2t.ai")
+    console.print("  • SSO login via Azure: https://rmm.s2t.ai/login")
     console.print("  • Agent server health: https://agents.s2t.ai/health")
-    console.print("  • Set code signing token in TRMM → Settings → Code Signing (any value)")
+    console.print("  • No license warning should appear on dashboard")
 
     client.close()
 

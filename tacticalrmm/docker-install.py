@@ -147,7 +147,7 @@ CERT_PUB_B64  = cert_pub_out.strip()
 CERT_PRIV_B64 = cert_priv_out.strip()
 console.print(f"[green]Certs encoded:[/] pub={len(CERT_PUB_B64)}B priv={len(CERT_PRIV_B64)}B")
 
-env_content = f"""IMAGE_REPO=tacticalrmm/
+env_content = f"""IMAGE_REPO=ghcr.io/cakriwut/
 VERSION=latest
 TRMM_USER={TACTICAL_USER}
 TRMM_PASS={TACTICAL_PASS}
@@ -163,6 +163,7 @@ POSTGRES_PASS={PG_PASS}
 MESH_PERSISTENT_CONFIG=1
 CERT_PUB_KEY={CERT_PUB_B64}
 CERT_PRIV_KEY={CERT_PRIV_B64}
+AGENT_BASE_URL=https://agents.s2t.ai
 """
 
 run(client, f"mkdir -p {INSTALL_DIR}", sudo=True)
